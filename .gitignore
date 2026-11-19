@@ -1,0 +1,12 @@
+# Konfigurasi lokal
+server/config/server.env
+admin/config/admin.env
+
+# Data runtime (di HP)
+server/data/
+server/run/
+
+# Backup yang ditarik ke perangkat admin
+admin/backups/
+
+.DS_Store

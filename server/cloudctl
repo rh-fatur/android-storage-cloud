@@ -1,0 +1,261 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# cloudctl (SERVER) - dijalankan di HP Android (Termux).
+# Satu pintu untuk semua operasi server: setup, start, stop, status, dst.
+set -eu
+
+SERVER_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+ENV_FILE="$SERVER_DIR/config/server.env"
+DATA_DIR="$SERVER_DIR/data"
+RUN_DIR="$SERVER_DIR/run"
+PID_FILE="$RUN_DIR/filebrowser.pid"
+SSHD_PID_FILE="${PREFIX:-/data/data/com.termux/files/usr}/var/run/sshd.pid"
+SSHD_CONFIG="${PREFIX:-/data/data/com.termux/files/usr}/etc/ssh/sshd_config"
+PACKAGES="openssh termux-api curl tar gzip procps net-tools nano"
+
+log() { printf '%s\n' "$*"; }
+die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+load_env() {
+  if [ ! -f "$ENV_FILE" ]; then
+    cp "$SERVER_DIR/config/server.env.example" "$ENV_FILE"
+    log "config/server.env dibuat dari contoh."
+  fi
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+  FB_PORT="${FB_PORT:-8080}"
+  FB_ADDRESS="${FB_ADDRESS:-0.0.0.0}"
+  FB_ROOT="${FB_ROOT:-$HOME/storage/shared/CloudStorage}"
+  FB_DB="${FB_DB:-$DATA_DIR/filebrowser.db}"
+  FB_LOG="${FB_LOG:-$DATA_DIR/filebrowser.log}"
+  FB_LOG_MAX_KB="${FB_LOG_MAX_KB:-2048}"
+}
+
+# ---------- helper proses & jaringan ----------
+fb_running() {
+  [ -f "$PID_FILE" ] || return 1
+  local pid; pid="$(cat "$PID_FILE")"
+  kill -0 "$pid" 2>/dev/null && grep -q filebrowser "/proc/$pid/cmdline" 2>/dev/null
+}
+
+sshd_running() { pgrep -x sshd >/dev/null 2>&1; }
+
+all_ips() {
+  { ifconfig 2>/dev/null || ip -4 addr 2>/dev/null || true; } | awk '
+    /inet / { ip=$2; sub(/addr:/,"",ip); sub(/\/.*/,"",ip); if (ip !~ /^127\./) print ip }'
+}
+
+print_access() {
+  local ip label
+  for ip in $(all_ips); do
+    case "$ip" in
+      100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) label="Tailscale" ;;
+      *) label="LAN" ;;
+    esac
+    log "Akses $label : http://$ip:$FB_PORT   |   ssh -p 8022 $(whoami)@$ip"
+  done
+}
+
+rotate_log() {
+  [ -f "$FB_LOG" ] || return 0
+  if [ "$(( $(wc -c < "$FB_LOG") / 1024 ))" -gt "$FB_LOG_MAX_KB" ]; then
+    mv -f "$FB_LOG" "$FB_LOG.old"
+    log "Log dirotasi."
+  fi
+}
+
+# ---------- perintah ----------
+cmd_setup() {
+  [ "$(uname -m)" = "aarch64" ] || die "Hanya mendukung 64-bit (aarch64), terdeteksi: $(uname -m)"
+  load_env
+
+  if [ ! -d "$HOME/storage/shared" ]; then
+    have termux-setup-storage && termux-setup-storage || true
+    sleep 2
+    [ -d "$HOME/storage/shared" ] || die "Akses storage belum diberikan. Jalankan 'termux-setup-storage' langsung di HP (tidak bisa lewat SSH), izinkan, lalu ulangi."
+  fi
+
+  log "Memasang paket: $PACKAGES"
+  pkg update -y >/dev/null
+  # shellcheck disable=SC2086
+  pkg install -y $PACKAGES
+
+  if have filebrowser; then
+    log "Filebrowser sudah terpasang: $(filebrowser version | head -n1)"
+  else
+    install_filebrowser
+  fi
+  mkdir -p "$FB_ROOT" "$DATA_DIR"
+  log "Setup selesai. Atur password SSH bila belum: passwd"
+}
+
+install_filebrowser() {
+  local tmp url tag
+  tmp="$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/fb.XXXXXX")"
+  trap 'rm -rf "$tmp"' RETURN
+  log "Mencari rilis Filebrowser terbaru (linux-arm64)..."
+  curl -fsS --retry 3 https://api.github.com/repos/filebrowser/filebrowser/releases/latest > "$tmp/release.json" \
+    || die "Gagal menghubungi GitHub API (cek internet / rate limit)."
+  url="$(grep 'browser_download_url.*linux-arm64.*tar.gz' "$tmp/release.json" | head -n1 | cut -d '"' -f 4)"
+  tag="$(grep '"tag_name"' "$tmp/release.json" | head -n1 | cut -d '"' -f 4)"
+  [ -n "$url" ] || die "URL rilis linux-arm64 tidak ditemukan."
+
+  if [ "${1:-}" = "--if-newer" ] && have filebrowser && filebrowser version 2>/dev/null | grep -q "${tag#v}"; then
+    log "Filebrowser sudah versi terbaru ($tag)."
+    return 0
+  fi
+
+  log "Mengunduh $tag ..."
+  curl -fsSL --retry 3 "$url" -o "$tmp/fb.tar.gz"
+  tar -xzf "$tmp/fb.tar.gz" -C "$tmp" filebrowser
+  chmod +x "$tmp/filebrowser"
+  mv -f "$tmp/filebrowser" "$PREFIX/bin/filebrowser"
+  log "Terpasang: $(filebrowser version | head -n1)"
+}
+
+cmd_update() {
+  local was_running=0
+  load_env
+  fb_running && was_running=1 && cmd_stop
+  install_filebrowser --if-newer
+  [ "$was_running" = 1 ] && cmd_start
+  return 0
+}
+
+cmd_start() {
+  load_env
+  have filebrowser || die "Filebrowser belum terpasang. Jalankan: cloudctl setup"
+  mkdir -p "$FB_ROOT" "$DATA_DIR" "$RUN_DIR" "$(dirname "$FB_DB")" "$(dirname "$FB_LOG")"
+  rotate_log
+  have termux-wake-lock && termux-wake-lock || true
+
+  if sshd_running; then
+    log "sshd sudah berjalan."
+  elif have sshd; then
+    sshd && log "sshd dijalankan (port 8022)."
+  else
+    log "Peringatan: openssh belum terpasang (jalankan 'cloudctl setup')."
+  fi
+
+  if fb_running; then
+    log "Filebrowser sudah berjalan (PID $(cat "$PID_FILE"))."
+  else
+    nohup filebrowser -a "$FB_ADDRESS" -p "$FB_PORT" -r "$FB_ROOT" -d "$FB_DB" >> "$FB_LOG" 2>&1 &
+    echo $! > "$PID_FILE"
+    sleep 2
+    fb_running || { rm -f "$PID_FILE"; die "Filebrowser gagal start. Cek: cloudctl logs"; }
+    log "Filebrowser dijalankan (PID $(cat "$PID_FILE"))."
+  fi
+  log "Folder root : $FB_ROOT"
+  print_access
+}
+
+cmd_stop() {
+  local i
+  if fb_running; then
+    kill "$(cat "$PID_FILE")"
+    for i in 1 2 3 4 5; do fb_running || break; sleep 1; done
+    fb_running && kill -9 "$(cat "$PID_FILE")" 2>/dev/null || true
+    log "Filebrowser dihentikan."
+  else
+    log "Filebrowser tidak berjalan."
+  fi
+  rm -f "$PID_FILE"
+  if [ "${1:-}" = "--all" ]; then
+    # Hanya listener sshd yang dimatikan; sesi SSH aktif tidak terputus.
+    if [ -f "$SSHD_PID_FILE" ]; then kill "$(cat "$SSHD_PID_FILE")" 2>/dev/null && log "sshd dihentikan."; fi
+    have termux-wake-unlock && termux-wake-unlock && log "Wake-lock dilepas."
+  fi
+}
+
+cmd_restart() { cmd_stop; cmd_start; }
+
+cmd_status() {
+  load_env
+  sshd_running && log "sshd        : BERJALAN (8022)" || log "sshd        : mati"
+  fb_running   && log "filebrowser : BERJALAN (port $FB_PORT, PID $(cat "$PID_FILE"))" || log "filebrowser : mati"
+  print_access
+  log "Storage     : $(df -h "$( [ -d "$FB_ROOT" ] && echo "$FB_ROOT" || echo "$HOME" )" 2>/dev/null | awk 'NR==2 {print $3" terpakai / "$2" ("$5")"}')"
+  if have termux-battery-status; then
+    log "Baterai     : $(timeout 5 termux-battery-status 2>/dev/null | tr -d ' \n' | sed 's/[{}"]//g')"
+  fi
+  log "Uptime      : $(uptime -p 2>/dev/null || uptime)"
+}
+
+cmd_logs() {
+  load_env
+  [ -f "$FB_LOG" ] || die "Belum ada log di $FB_LOG"
+  if [ "${1:-}" = "-f" ]; then tail -n 50 -f "$FB_LOG"; else tail -n "${1:-50}" "$FB_LOG"; fi
+}
+
+# backup [folder]   -> simpan file tar.gz di HP
+# backup --stdout   -> tulis tar.gz ke stdout (dipakai admin untuk menarik backup)
+cmd_backup() {
+  load_env
+  local files=()
+  [ -f "$FB_DB" ] && files+=("$FB_DB")
+  [ -f "$ENV_FILE" ] && files+=("$ENV_FILE")
+  [ ${#files[@]} -gt 0 ] || die "Tidak ada yang dibackup."
+  if [ "${1:-}" = "--stdout" ]; then
+    tar -czf - "${files[@]}" 2>/dev/null
+    return 0
+  fi
+  local dest="${1:-$HOME/storage/shared/CloudBackup}" out
+  mkdir -p "$dest"
+  out="$dest/cloud-config-$(date +%Y%m%d-%H%M%S).tar.gz"
+  tar -czf "$out" "${files[@]}" 2>/dev/null
+  log "Backup tersimpan: $out"
+}
+
+cmd_boot_install() {
+  local dir="$HOME/.termux/boot"
+  mkdir -p "$dir"
+  printf '#!/data/data/com.termux/files/usr/bin/bash\nexec bash "%s/boot/start-cloud.sh"\n' "$SERVER_DIR" > "$dir/start-cloud.sh"
+  chmod +x "$dir/start-cloud.sh" "$SERVER_DIR/boot/start-cloud.sh"
+  log "Auto-start terpasang: $dir/start-cloud.sh"
+  log "Buka aplikasi Termux:Boot sekali & matikan optimasi baterai untuk Termux/Termux:Boot."
+}
+
+# Matikan login password SSH (hanya kunci publik). Pastikan kunci sudah terpasang!
+cmd_ssh_harden() {
+  [ -s "$HOME/.ssh/authorized_keys" ] || die "~/.ssh/authorized_keys kosong. Jalankan 'cloudctl init' dari admin dulu."
+  if grep -q '^PasswordAuthentication' "$SSHD_CONFIG" 2>/dev/null; then
+    sed -i 's/^PasswordAuthentication.*/PasswordAuthentication no/' "$SSHD_CONFIG"
+  else
+    echo 'PasswordAuthentication no' >> "$SSHD_CONFIG"
+  fi
+  [ -f "$SSHD_PID_FILE" ] && kill "$(cat "$SSHD_PID_FILE")" 2>/dev/null || true
+  sleep 1; sshd
+  log "Login password SSH dinonaktifkan; hanya kunci publik yang diterima."
+}
+
+cmd_help() {
+  cat <<'H'
+cloudctl (server) - perintah:
+  setup            instal paket + Filebrowser (idempotent)
+  start | stop [--all] | restart
+  status           status layanan, alamat akses, storage, baterai
+  logs [-f|N]      lihat log Filebrowser
+  update           perbarui Filebrowser ke rilis terbaru
+  backup [dir|--stdout]
+  boot-install     pasang auto-start Termux:Boot
+  ssh-harden       nonaktifkan login password SSH
+H
+}
+
+case "${1:-help}" in
+  setup)        cmd_setup ;;
+  start)        cmd_start ;;
+  stop)         shift; cmd_stop "${1:-}" ;;
+  restart)      cmd_restart ;;
+  status)       cmd_status ;;
+  logs)         shift; cmd_logs "${1:-}" ;;
+  update)       cmd_update ;;
+  backup)       shift; cmd_backup "${1:-}" ;;
+  boot-install) cmd_boot_install ;;
+  ssh-harden)   cmd_ssh_harden ;;
+  help|-h|--help) cmd_help ;;
+  *) cmd_help; exit 1 ;;
+esac

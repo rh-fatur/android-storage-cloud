@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# cloudctl (ADMIN) - dijalankan di laptop/PC (Linux, macOS, WSL, Git Bash).
+# Mengendalikan HP server lewat SSH. Tidak ada layanan cloud yang jalan di sini.
+set -euo pipefail
+
+ADMIN_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SERVER_SRC="$(dirname "$ADMIN_DIR")/server"
+CONF="$ADMIN_DIR/config/admin.env"
+
+die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+load_conf() {
+  [ -f "$CONF" ] || die "Belum dikonfigurasi. Jalankan: ./admin/cloudctl init"
+  # shellcheck disable=SC1090
+  . "$CONF"
+  SSH_PORT="${SSH_PORT:-8022}"
+  SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519_cloud}"
+  REMOTE_DIR="${REMOTE_DIR:-android-storage-cloud}"
+  REMOTE_ROOT="${REMOTE_ROOT:-storage/shared/CloudStorage}"
+  FB_PORT="${FB_PORT:-8080}"
+  [ -n "${CLOUD_HOST:-}" ] && [ -n "${CLOUD_USER:-}" ] || die "CLOUD_HOST/CLOUD_USER kosong di $CONF"
+  TARGET="$CLOUD_USER@$CLOUD_HOST"
+
+  COMMON=(-i "$SSH_KEY" -o IdentitiesOnly=yes -o ConnectTimeout=8 -o ServerAliveInterval=15 -o StrictHostKeyChecking=accept-new)
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) ;;  # ControlMaster tidak didukung di Windows
+    *) mkdir -p "$HOME/.ssh"
+       COMMON+=(-o ControlMaster=auto -o ControlPersist=60 -o "ControlPath=$HOME/.ssh/cm-cloud-%C") ;;
+  esac
+}
+
+# Jalankan 'cloudctl <args>' milik server di HP.
+rc()     { ssh "${COMMON[@]}" -p "$SSH_PORT" "$TARGET" "bash \"\$HOME/$REMOTE_DIR/cloudctl\" $(printf '%q ' "$@")"; }
+rc_tty() { ssh -t "${COMMON[@]}" -p "$SSH_PORT" "$TARGET" "bash \"\$HOME/$REMOTE_DIR/cloudctl\" $(printf '%q ' "$@")"; }
+
+cmd_init() {
+  local host user port key
+  [ -f "$CONF" ] && { read -r -p "admin.env sudah ada. Timpa? [y/N] " a; [ "$a" = y ] || exit 0; }
+  read -r -p "IP / hostname HP server: " host
+  read -r -p "Username Termux (jalankan 'whoami' di HP): " user
+  read -r -p "Port SSH [8022]: " port; port="${port:-8022}"
+  key="$HOME/.ssh/id_ed25519_cloud"
+
+  mkdir -p "$HOME/.ssh"
+  [ -f "$key" ] || ssh-keygen -t ed25519 -f "$key" -N "" -C "cloud-admin@$(hostname)"
+
+  echo "Memasang kunci publik di HP (masukkan password SSH Termux sekali)..."
+  ssh -o StrictHostKeyChecking=accept-new -p "$port" "$user@$host" \
+    'mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && cat >> ~/.ssh/authorized_keys' < "$key.pub"
+
+  sed -e "s|^CLOUD_HOST=.*|CLOUD_HOST=$host|" \
+      -e "s|^CLOUD_USER=.*|CLOUD_USER=$user|" \
+      -e "s|^SSH_PORT=.*|SSH_PORT=$port|" \
+      "$ADMIN_DIR/config/admin.env.example" > "$CONF"
+
+  load_conf
+  ssh "${COMMON[@]}" -o BatchMode=yes -p "$SSH_PORT" "$TARGET" 'echo "Login dengan kunci: OK"'
+  echo "Selesai. Berikutnya: ./admin/cloudctl deploy && ./admin/cloudctl setup"
+}
+
+cmd_deploy() {
+  [ -x "$SERVER_SRC/cloudctl" ] || die "Folder server/ tidak ditemukan di $SERVER_SRC"
+  echo "Mengirim server/ ke $TARGET:~/$REMOTE_DIR ..."
+  COPYFILE_DISABLE=1 tar -C "$SERVER_SRC" -cf - cloudctl boot config/server.env.example \
+    | ssh "${COMMON[@]}" -p "$SSH_PORT" "$TARGET" \
+        "mkdir -p \"\$HOME/$REMOTE_DIR\" && tar -C \"\$HOME/$REMOTE_DIR\" -xf - && chmod +x \"\$HOME/$REMOTE_DIR/cloudctl\" \"\$HOME/$REMOTE_DIR/boot/start-cloud.sh\""
+  echo "Deploy selesai (config/server.env & data di HP tidak disentuh)."
+}
+
+cmd_status() {
+  rc status
+  if have curl; then
+    local code
+    code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://$CLOUD_HOST:$FB_PORT/" || true)"
+    echo "Web UI      : http://$CLOUD_HOST:$FB_PORT  (HTTP ${code:-000} dari perangkat ini)"
+  fi
+}
+
+cmd_backup() {
+  local dest="${1:-$ADMIN_DIR/backups}" out
+  mkdir -p "$dest"
+  out="$dest/cloud-config-$(date +%Y%m%d-%H%M%S).tar.gz"
+  rc backup --stdout > "$out"
+  [ -s "$out" ] || { rm -f "$out"; die "Backup kosong/gagal."; }
+  echo "Backup tersimpan di perangkat admin: $out"
+}
+
+cmd_pull() { [ $# -ge 1 ] || die "Pemakaian: pull <path-di-cloud> [folder-lokal]"
+  scp -r "${COMMON[@]}" -P "$SSH_PORT" "$TARGET:$REMOTE_ROOT/$1" "${2:-.}"; }
+cmd_push() { [ $# -ge 1 ] || die "Pemakaian: push <file/folder-lokal> [folder-tujuan-di-cloud]"
+  scp -r "${COMMON[@]}" -P "$SSH_PORT" "$1" "$TARGET:$REMOTE_ROOT/${2:-}"; }
+
+cmd_open() {
+  local url="http://$CLOUD_HOST:$FB_PORT"
+  if   have xdg-open; then xdg-open "$url"
+  elif have open;     then open "$url"
+  elif have start;    then start "$url"
+  else echo "$url"; fi
+}
+
+cmd_help() {
+  cat <<'H'
+cloudctl (admin) - kendalikan HP server dari laptop/PC
+
+Pertama kali:
+  init                 buat kunci SSH, hubungkan ke HP, simpan konfigurasi
+  deploy               kirim skrip server/ ke HP
+  setup                instal paket & Filebrowser di HP (lewat deploy otomatis)
+
+Harian:
+  start | stop | restart | status | logs [-f]
+  update               deploy ulang skrip + perbarui Filebrowser
+  open                 buka Web UI di browser
+  shell                SSH interaktif ke HP
+  config               edit config/server.env di HP (nano)
+  backup [folder]      tarik backup database+config ke perangkat ini
+  pull <path> [lokal]  salin dari cloud ke perangkat ini
+  push <lokal> [path]  salin ke cloud
+  boot-install         pasang auto-start di HP
+  ssh-harden           matikan login password SSH (setelah init berhasil)
+H
+}
+
+main() {
+  local c="${1:-help}"; [ $# -gt 0 ] && shift
+  case "$c" in
+    help|-h|--help) cmd_help; return ;;
+    init)           cmd_init; return ;;
+  esac
+  load_conf
+  case "$c" in
+    deploy)   cmd_deploy ;;
+    setup)    cmd_deploy; rc_tty setup ;;
+    update)   cmd_deploy; rc update ;;
+    status)   cmd_status ;;
+    logs)     if [ "${1:-}" = "-f" ]; then rc_tty logs -f; else rc logs "$@"; fi ;;
+    stop)     [ "${1:-}" = "--all" ] && echo "Peringatan: listener sshd ikut berhenti; Anda harus menyalakan ulang dari HP."
+              rc stop "$@" ;;
+    start|restart|boot-install) rc "$c" ;;
+    ssh-harden) rc ssh-harden ;;
+    config)   ssh -t "${COMMON[@]}" -p "$SSH_PORT" "$TARGET" "nano \"\$HOME/$REMOTE_DIR/config/server.env\"" ;;
+    shell)    ssh -t "${COMMON[@]}" -p "$SSH_PORT" "$TARGET" ;;
+    backup)   cmd_backup "$@" ;;
+    pull)     cmd_pull "$@" ;;
+    push)     cmd_push "$@" ;;
+    open)     cmd_open ;;
+    *)        cmd_help; exit 1 ;;
+  esac
+}
+main "$@"
