@@ -2,11 +2,9 @@
 server/config/server.env
 admin/config/admin.env
 
-# Data runtime (di HP)
+# Data runtime
 server/data/
 server/run/
-
-# Backup yang ditarik ke perangkat admin
-admin/backups/
+admin/run/
 
 .DS_Store

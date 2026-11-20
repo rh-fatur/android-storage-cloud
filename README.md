@@ -1,151 +1,168 @@
-# Termux Cloud Server (Android 9–11)
+# Android Storage Cloud
 
-Repositori ini berisi rencana setup, panduan penggunaan admin, dan skrip otomatisasi untuk mengubah HP Android jadul (atau HP yang di-*port* ke Custom ROM **Android 9–11**, arsitektur **64-bit / `aarch64`**) menjadi **Personal Cloud / Home Storage Server** menggunakan **Termux**, **OpenSSH**, dan **Filebrowser**.
-
-> **Catatan keamanan & baterai:**
-> * Jalankan server ini di jaringan lokal (Wi-Fi rumah) atau lewat jaringan privat **Tailscale**. Hindari membuka *port* langsung ke internet publik tanpa lapisan keamanan tambahan.
-> * Gunakan charger standar (bukan *fast charging* berlebih jika tidak diperlukan), letakkan HP di tempat berventilasi baik, dan pertimbangkan pembatas pengisian daya (misalnya modul ACC jika HP sudah *root*) untuk penggunaan 24/7.
-
----
-
-## Ringkasan Cara Kerja
-
-Daripada menjalankan aplikasi cloud berat seperti Nextcloud yang membutuhkan web server, PHP, dan database terpisah, setup ini menggunakan pendekatan ringan yang cocok untuk HP bekas:
-
-* **Termux:** Lingkungan terminal Linux di Android untuk menjalankan layanan *background* dan skrip administrasi.
-* **OpenSSH (`sshd`):** Memungkinkan admin mengakses terminal HP dari laptop/PC secara *remote* serta mentransfer file lewat protokol **SFTP**.
-* **Filebrowser:** Menyediakan antarmuka web modern mirip Google Drive untuk *upload/download*, mengelola folder, *preview* media, membuat akun pengguna, dan berbagi file lewat jaringan lokal maupun Tailscale.
-* **Termux:Boot + `termux-wake-lock`:** Menjaga proses tetap hidup dan otomatis menyala kembali setelah HP *restart*.
-
----
-
-## Persiapan Perangkat & Aplikasi
-
-### 1. Perangkat Keras (*Hardware*)
-* **HP Android 9–11 (64-bit / `aarch64`):** Ideal dengan RAM minimal 3 GB (2 GB masih bisa untuk beban ringan) dan penyimpanan internal yang memadai.
-* **Jika memakai HP *port* / Custom ROM:** Pastikan Wi-Fi, pengisian daya, dan akses penyimpanan berjalan stabil.
-* **Charger & kabel yang layak** serta posisi HP yang tidak memerangkap panas.
-
-### 2. Aplikasi di HP Server
-* **Termux:** Wajib instal dari sumber yang sama (GitHub Releases resmi atau F-Droid), **bukan** dari Google Play Store.
-* **Termux:Boot:** Wajib instal dari sumber yang sama dengan Termux (GitHub atau F-Droid) agar *signature* aplikasi cocok dan skrip *auto-start* bisa berjalan.
-* **Tailscale (Opsional):** Untuk mengakses server dari luar rumah (data seluler / Wi-Fi luar) tanpa *port forwarding* router.
-* **ACC / pengatur baterai (Opsional, khusus HP *root*):** Membantu menjaga kesehatan baterai saat dicolok terus-menerus.
-
-### 3. Perangkat Admin (Laptop / PC / HP Utama)
-> Hanya perangkat ini yang menjalankan `admin/cloudctl`. Tidak ada layanan cloud di sini.
-* Terminal/SSH client (atau aplikasi seperti Termius / WinSCP / FileZilla) untuk mengelola HP dari jarak jauh.
-* Browser web modern untuk membuka dashboard Filebrowser.
-
----
-
-## Arsitektur: Dua Perangkat, Dua Folder
-
-| | **Perangkat Server** (HP Android) | **Perangkat Admin** (Laptop/PC) |
-| --- | --- | --- |
-| Folder | `server/` | `admin/` |
-| Menjalankan | sshd + Filebrowser | hanya CLI pengendali |
-| CLI | `server/cloudctl` (di Termux) | `admin/cloudctl` (Linux, macOS, WSL, Git Bash) |
-| Konfigurasi | `server/config/server.env` (di HP) | `admin/config/admin.env` (di laptop) |
-
-Admin **tidak perlu menyentuh HP** setelah bootstrap awal. `admin/cloudctl` mengirim skrip `server/` lewat SSH lalu menjalankan `server/cloudctl` di HP. Setiap perintah admin hanyalah pembungkus tipis untuk perintah server dengan nama yang sama.
+Satu HP Android jadul jadi **cloud pribadi**, dikendalikan dari **HP Android lain**. Keduanya hanya butuh **Termux**, tanpa root dan tanpa web.
 
 ```text
-android-storage-cloud/
-├── README.md  AGENTS.md  LICENSE  .gitignore
-├── server/                        # ← berjalan di HP (Termux)
-│   ├── cloudctl                   # setup | start | stop | status | logs | update | backup | boot-install | ssh-harden
-│   ├── boot/start-cloud.sh        # dipanggil Termux:Boot (menunggu jaringan siap)
-│   └── config/server.env.example
-└── admin/                         # ← berjalan di laptop/PC
-    ├── cloudctl                   # init | deploy | setup | start | status | open | shell | backup | pull | push ...
-    └── config/admin.env.example
+ HP admin (apa saja)  ──── SSH/SFTP, port 8022 ────▶  HP cloud (jadul, dicolok terus)
+ perintah: cloud ...                                   perintah: cloudctl ...
+                                                       sshd + folder CloudStorage + watchdog
 ```
 
----
+Server hanya terdiri dari tiga hal: **sshd** (SSH dan SFTP), **satu folder penyimpanan**, dan **watchdog** yang menjaga semuanya tetap hidup dan online. File dikirim dan diambil lewat `cloud push` dan `cloud pull`, atau lewat aplikasi SFTP apa pun.
 
-## Setup Awal
+> **Keselamatan:** baterai HP lama yang dicolok 24/7 bisa menggembung. Taruh di tempat berventilasi dan hentikan pemakaian bila baterai membesar atau sangat panas.
 
-### A. Di HP server (sekali, manual)
-Buka Termux, lalu:
+## Syarat
+
+| | HP cloud | HP admin |
+| --- | --- | --- |
+| Android | 9 sampai 12 (API 28–32) | HP apa saja (Termux untuk perintah `cloud`; tanpa Termux lihat bagian *Admin tanpa Termux*) |
+| Arsitektur | 32-bit atau 64-bit (`armv7l`, `armv8l`, `aarch64`, x86) | bebas |
+| Kernel | tidak butuh fitur khusus (hanya sshd dan shell) | bebas |
+| Aplikasi | Termux, Termux:Boot, Termux:API | Termux, Termux:API (notifikasi). `rsync` terpasang otomatis, membuat transfer bisa dilanjutkan |
+| Koneksi | Wi-Fi stabil, **online terus**, dicolok charger | online saat dipakai |
+
+Termux, Termux:Boot, dan Termux:API wajib dari sumber yang sama (**F-Droid** atau **GitHub Releases**), bukan Play Store.
+
+## Setup
+
+Hanya tiga langkah. HP cloud cukup memakai **satu file** (`server/cloudctl`) dan satu perintah.
+
+**1. Di HP cloud** (satu perintah mengerjakan semuanya):
+
+Dapatkan filenya, lalu jalankan `install`:
 ```bash
-termux-setup-storage        # izinkan akses storage (hanya bisa dari HP langsung)
-pkg install -y openssh
-passwd                      # password sementara untuk login pertama
-whoami                      # catat username, mis. u0_a123
-sshd                        # port 8022
+pkg update -y && pkg install -y curl
+curl -fsSL https://raw.githubusercontent.com/rh-fatur/android-storage-cloud/main/server/cloudctl -o cloudctl
+bash cloudctl install
 ```
-Cek IP HP (Wi-Fi atau Tailscale), mis. dengan `ifconfig`.
+> Alamat `raw.githubusercontent.com` hanya bekerja setelah `server/cloudctl` ada di cabang `main` repo Anda. Alternatif tanpa internet GitHub: pindahkan file `cloudctl` ke HP cloud (Bluetooth, Telegram, kabel), jalankan `termux-setup-storage` dulu, lalu `bash ~/storage/downloads/cloudctl install`.
 
-### B. Di laptop/PC admin
+`install` mengerjakan tujuh hal secara berurutan dan menampilkan progresnya (`[1/7]` sampai `[7/7]`):
+
+| Langkah | Yang dilakukan |
+| --- | --- |
+| 1 | Memeriksa Termux, versi Android, arsitektur, dan peringatan bila Termux dari Play Store |
+| 2 | Meminta izin storage (ketuk **Izinkan** di layar) dan menunggu sampai diberikan |
+| 3 | Memasang paket: `openssh`, `termux-api`, `net-tools`, `nano`, `rsync` |
+| 4 | Membuat folder cloud dan konfigurasi bawaan, serta kunci host SSH |
+| 5 | Meminta Anda mengatur password SSH (hanya jika belum ada password atau kunci) |
+| 6 | Menjalankan sshd dan watchdog |
+| 7 | Memasang auto-start untuk Termux:Boot |
+
+Skrip berakhir dengan perintah siap salin untuk HP admin, misalnya:
+```text
+cloud init 192.168.1.50 u0_a123
+```
+Dijalankan dari folder lain (mis. `Download`), skrip menyalin dirinya ke `~/cloud-server` dan melanjutkan dari sana. Aman dijalankan ulang kapan saja. Opsi: `--yes` (tanpa pertanyaan) dan `--no-passwd`.
+
+Beberapa hal tidak bisa diotomatiskan oleh aplikasi mana pun, jadi skrip mencetaknya sebagai daftar akhir: buka **Termux:Boot** satu kali, atur pengecualian baterai (skrip menawarkan membukanya), dan aktifkan **Tetap aktif** di Opsi pengembang.
+
+**2. Di HP admin** (clone ke `~`, jangan ke `/sdcard`):
 ```bash
-git clone https://github.com/rh-fatur/android-storage-cloud.git
+pkg update -y && pkg install -y git
+cd ~ && git clone https://github.com/rh-fatur/android-storage-cloud.git
 cd android-storage-cloud
-
-./admin/cloudctl init       # isi IP & username; kunci SSH dipasang otomatis
-./admin/cloudctl setup      # kirim skrip + instal Filebrowser di HP
-./admin/cloudctl start
-./admin/cloudctl boot-install   # auto-start setelah HP restart
-./admin/cloudctl ssh-harden     # (disarankan) matikan login password
+bash admin/install.sh       # memasang paket + perintah `cloud`
 ```
-> Windows: gunakan WSL atau Git Bash (butuh `ssh`, `scp`, `tar`).
 
-### C. Login pertama Filebrowser
+**3. Hubungkan** (dari HP admin, tempel perintah yang dicetak langkah 1):
 ```bash
-./admin/cloudctl open        # buka Web UI
-./admin/cloudctl logs        # cari password admin awal (versi baru: acak, tercetak di log)
+cloud init 192.168.1.50 u0_a123   # kunci SSH dipasang otomatis (password diminta sekali)
+cloud doctor                      # cek koneksi langkah demi langkah
+cloud ssh-harden                  # matikan login password (setelah kunci berfungsi)
+cloud monitor --bg                # notifikasi di HP admin bila HP cloud mati
 ```
-Segera ganti password di **Settings → Profile Settings**, dan buat akun terpisah per pengguna di **Settings → User Management**.
+`cloud setup` tidak wajib untuk pemasangan pertama. Ia berguna untuk memperbaiki: mengirim ulang skrip lalu menjalankan `install` lagi di HP cloud.
 
-Terakhir buka aplikasi **Termux:Boot** sekali di HP dan matikan optimasi baterai untuk Termux & Termux:Boot.
+**Memperbarui kemudian:** `cloud upgrade` (git pull + kirim skrip terbaru). Jalankan `cloud restart` bila watchdog berubah.
 
----
-
-## Pemakaian Harian (dari laptop/PC)
+## Pemakaian
 
 | Tujuan | Perintah |
 | --- | --- |
-| Status, alamat akses, storage, baterai | `./admin/cloudctl status` |
-| Start / stop / restart | `./admin/cloudctl start` · `stop` · `restart` |
-| Lihat log (live) | `./admin/cloudctl logs -f` |
-| Buka Web UI | `./admin/cloudctl open` |
-| Edit konfigurasi server | `./admin/cloudctl config` lalu `restart` |
-| Perbarui skrip + Filebrowser | `./admin/cloudctl update` |
-| Backup DB & config ke laptop | `./admin/cloudctl backup` (tersimpan di `admin/backups/`) |
-| Salin file dari/ke cloud | `./admin/cloudctl pull Foto/2026 .` · `./admin/cloudctl push ./dokumen Dokumen` |
-| Terminal HP | `./admin/cloudctl shell` |
+| Status (perangkat, sshd, internet, IP, storage, baterai) | `cloud status` |
+| Start / restart | `cloud start` · `cloud restart` |
+| Hentikan sshd + watchdog (minta konfirmasi) | `cloud stop` |
+| Isi folder cloud | `cloud ls` · `cloud ls Foto` |
+| Buat folder | `cloud mkdir Foto/2026` |
+| Kirim ke cloud | `cloud push ~/storage/shared/DCIM/foto.jpg Foto` |
+| Ambil dari cloud | `cloud pull Foto/foto.jpg` (masuk ke Downloads) |
+| Hapus dari cloud (permanen, minta konfirmasi) | `cloud rm Foto/lama.jpg` |
+| Log watchdog | `cloud logs` · `cloud logs -f` |
+| Edit konfigurasi HP cloud | `cloud config`, lalu `cloud restart` |
+| Perbarui skrip dari repo | `cloud upgrade` (git pull + deploy) |
+| Diagnosa masalah | `cloud doctor` |
+| Ubah IP tanpa edit file | `cloud set CLOUD_HOST 192.168.1.60` |
+| Terminal HP cloud | `cloud shell` |
 
-Pengguna biasa cukup membuka `http://IP-HP:8080` di browser. SFTP juga tersedia di port `8022` (user & kunci/password yang sama).
+Tambahkan `-y` untuk melewati pertanyaan konfirmasi (`cloud -y rm ...`). Perintah `push` dan `pull` memakai **rsync** bila ada di kedua HP, sehingga transfer yang putus di tengah bisa dilanjutkan dengan mengulang perintah yang sama. Tanpa rsync dipakai `scp`. Path di `rm`, `mkdir`, `ls`, `push`, dan `pull` selalu relatif terhadap folder cloud; `..` dan awalan `/` ditolak.
 
-> **Perintah langsung di HP** (tanpa admin): `bash ~/android-storage-cloud/cloudctl help`. Daftar perintahnya sama.
+Langsung di HP cloud: `bash ~/cloud-server/cloudctl help`.
 
-### Akses dari luar rumah (Tailscale)
-Pasang Tailscale di HP server dan perangkat admin/pengguna dengan akun yang sama, lalu isi `CLOUD_HOST` di `admin/config/admin.env` dengan IP Tailscale HP (`100.x.y.z`). Tanpa port forwarding.
+### Di rumah dan di luar rumah
+Isi alamat cadangan dengan IP Tailscale HP cloud:
+```bash
+cloud set CLOUD_HOST_ALT 100.101.102.103
+```
+Perintah `cloud` mencoba alamat utama (Wi-Fi rumah) dulu, lalu otomatis beralih ke alamat cadangan bila tidak menjawab. Monitor juga menganggap HP cloud hidup selama salah satu alamat menjawab. Tailscale dipasang sebagai aplikasi di kedua HP.
 
----
+### Admin tanpa Termux
+HP apa pun yang punya aplikasi SFTP/SSH (Termius, Solid Explorer, dan sejenisnya) bisa mengakses cloud. Jalankan `cloud info` dari HP yang sudah punya Termux untuk melihat host, port, user, dan folder awal. Setelah `cloud ssh-harden`, login password dimatikan sehingga aplikasi tersebut harus memakai kunci SSH, bukan password.
+
+## Cara server bekerja
+
+1. `cloudctl start` mengaktifkan **wake-lock**, menjalankan **sshd** di port 8022, lalu **watchdog** di latar belakang.
+2. Folder `CLOUD_ROOT` (bawaan `~/storage/shared/CloudStorage`) adalah isi cloud. Karena ada di storage bersama, juga terlihat di aplikasi File di HP cloud.
+3. **Watchdog** (tiap `WD_INTERVAL` detik, bawaan 60):
+   * menyalakan ulang sshd jika mati;
+   * menguji internet lewat koneksi TCP ke `1.1.1.1:443` (cadangan `8.8.8.8:53`), tanpa DNS atau curl;
+   * jika gagal `WD_NET_FAILS` kali berturut-turut, mencoba mematikan lalu menyalakan Wi-Fi lewat Termux:API (hanya berhasil di sebagian perangkat);
+   * mencatat peringatan bila suhu baterai ≥ `WD_TEMP_WARN` atau charger terlepas.
+4. **Termux:Boot** menjalankan `cloudctl boot` setelah HP restart. Perintah itu menunggu jaringan siap (maksimal sekitar 60 detik), lalu menjalankan `start`. Log-nya di `~/cloud-server/data/boot.log`.
+5. **Monitor** di HP admin memeriksa port 8022 tiap 60 detik dan mengirim notifikasi Android saat HP cloud mati atau pulih.
+
+Watchdog tidak bisa memperbaiki router mati, gangguan ISP, listrik padam, atau Android yang mematikan Termux. Untuk itu ada monitor.
+
+## Menjaga HP cloud tetap online (pengaturan Android)
+
+* **Opsi pengembang → Tetap aktif** saat mengisi daya.
+* **Baterai → Tanpa pembatasan** untuk Termux, Termux:Boot, dan Termux:API. Kunci Termux di daftar aplikasi terbaru bila ROM mematikan aplikasi latar belakang.
+* **IP tetap:** pesan IP HP cloud di router (DHCP reservation), atau pakai Tailscale (IP `100.x.y.z` tidak berubah, dan bisa diakses dari luar rumah tanpa port forwarding).
+* **Android 12 (API 31–32):** sistem bisa mematikan proses latar Termux (*phantom process killer*), termasuk sshd. Menurut wiki Termux, perbaikannya lewat `adb` (Wireless debugging): `adb shell "settings put global settings_enable_monitor_phantom_procs false"`, atau di Android 12 awal: `adb shell "device_config put activity_manager max_phantom_processes 2147483647"`. Android 9–11 tidak terpengaruh.
 
 ## Keamanan
-* Jangan *port forward* 8080/8022 ke internet publik.
-* Pakai kunci SSH (`init`) dan jalankan `ssh-harden` setelah login kunci berhasil.
-* `ssh-harden` mematikan login password. Jaga kunci privat `~/.ssh/id_ed25519_cloud` di laptop; jika hilang, akses ulang lewat Termux langsung di HP.
-* Ganti password default Filebrowser dan buat akun per pengguna.
-* `backup` hanya mencakup database & konfigurasi; file di folder cloud perlu disalin terpisah (`pull` atau rsync/SFTP).
-
----
+* Jangan *port forward* 8022 ke internet publik. Untuk akses dari luar rumah, pakai Tailscale dan isi `CLOUD_HOST` dengan IP Tailscale.
+* Pakai kunci SSH dan jalankan `cloud ssh-harden`. Simpan kunci privat `~/.ssh/id_ed25519_cloud` di HP admin. Jika HP admin hilang, buka Termux langsung di HP cloud untuk memasang kunci baru.
+* Satu HP berarti satu titik gagal. Salin file penting ke tempat lain secara berkala.
 
 ## Pemecahan Masalah
 
 | Gejala | Solusi |
 | --- | --- |
-| `init` gagal konek | Pastikan `sshd` jalan di HP, IP benar, satu jaringan, port 8022. |
-| `setup`: "Akses storage belum diberikan" | Jalankan `termux-setup-storage` langsung di HP lalu ulangi `setup`. |
-| Server mati saat layar padam | Matikan optimasi baterai untuk Termux; `termux-wake-lock` dipasang otomatis oleh `start`. |
-| Tidak jalan setelah reboot | Buka Termux:Boot sekali; cek `server/data/boot.log` di HP; ulangi `boot-install`. |
-| Port 8080 terpakai | `./admin/cloudctl config` → ubah `FB_PORT`, lalu `restart` (dan `FB_PORT` di `admin.env`). |
-| Gagal unduh Filebrowser | Cek internet HP; GitHub API ada rate limit, coba lagi nanti. |
-| Setelah `stop --all` tidak bisa SSH | Nyalakan lagi dari HP: `sshd`. |
+| Perintah `cloud` bilang HP cloud tidak terjangkau | Jalankan `cloud doctor`; ia menunjukkan langkah mana yang gagal. Bila IP berubah: `cloud set CLOUD_HOST <ip-baru>`. |
+| `cloud init` gagal tersambung | Pastikan `sshd` jalan di HP cloud, IP benar, satu Wi-Fi (atau Tailscale), port 8022. |
+| "Skrip server belum terpasang" | Jalankan `cloud deploy`. |
+| `install`: "Izin storage belum diberikan" | Jalankan `termux-setup-storage` langsung di HP cloud, ketuk Izinkan, lalu ulangi `bash cloudctl install`. Izin ini tidak bisa diberikan lewat SSH. |
+| `install`: gagal memperbarui daftar paket | Cek internet HP cloud, atau ganti mirror dengan `termux-change-repo`, lalu ulangi `install`. |
+| `curl` ke `raw.githubusercontent.com` gagal (404) | `server/cloudctl` belum ada di cabang `main` repo Anda. Push dulu, atau pindahkan file manual. |
+| sshd sering mati sendiri | Cek `cloud logs`. Di Android 12, lihat bagian *phantom process killer*. |
+| Tidak menyala setelah HP cloud restart | Buka Termux:Boot sekali, cek `~/cloud-server/data/boot.log` di HP cloud, ulangi `cloud boot-install`. |
+| Notifikasi monitor tidak muncul | Pasang aplikasi Termux:API (sumber sama dengan Termux) dan izinkan notifikasinya. |
+| Tidak bisa SSH setelah `cloud stop` | `stop` mematikan sshd. Nyalakan dari HP cloud: `bash ~/cloud-server/cloudctl start`. |
+| `git`: "dubious ownership" | Repo ada di `/sdcard`. Pindahkan ke `~`, atau `git config --global --add safe.directory <path>`. |
 
----
+## Struktur
+
+```text
+├── server/
+│   └── cloudctl             # SATU file untuk HP cloud: install | start | stop | restart | status | logs | boot-install | ssh-harden
+│                            # (konfigurasi bawaan dan skrip auto-start sudah tertanam di dalamnya)
+└── admin/                   # dipakai di HP admin
+    ├── install.sh           # pasang paket + perintah `cloud`
+    ├── cloudctl             # init | setup | start | status | doctor | ls | mkdir | push | pull | rm | monitor | ...
+    └── config/admin.env.example
+```
 
 ## Lisensi
 Lihat berkas [LICENSE](LICENSE).

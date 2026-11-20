@@ -1,36 +1,31 @@
 # AGENTS.md
 
 ## Gambaran Proyek
-Skrip & dokumentasi untuk menjadikan HP Android (**Android 9–11** / Custom ROM setara, **64-bit `aarch64`**) sebagai **Personal Cloud Storage Server** ringan dengan **Termux**, **OpenSSH**, dan **Filebrowser**. Proyek dipisah menjadi dua sisi:
+Mengubah **satu HP Android jadul** (Android 9–12, 32 atau 64-bit) menjadi cloud pribadi, dikendalikan dari **satu HP Android lain**. Keduanya memakai Termux. Tanpa web, tanpa root.
 
-* `server/` – berjalan di **HP server** (Termux). Satu CLI: `server/cloudctl`.
-* `admin/` – berjalan di **laptop/PC admin** (Linux/macOS/WSL/Git Bash). `admin/cloudctl` hanya membungkus perintah server lewat SSH.
+Server = **sshd (SSH + SFTP) + folder `CLOUD_ROOT` + watchdog**. Tidak ada biner pihak ketiga yang diunduh, jadi tidak ada urusan arsitektur selain yang sudah ditangani paket `openssh` Termux.
 
-## Struktur
-```text
-├── server/
-│   ├── cloudctl                  # setup|start|stop|restart|status|logs|update|backup|boot-install|ssh-harden
-│   ├── boot/start-cloud.sh       # entry Termux:Boot
-│   └── config/server.env.example
-└── admin/
-    ├── cloudctl                  # init|deploy|setup|... + open|shell|config|pull|push|backup
-    └── config/admin.env.example
-```
-Runtime di HP (tidak di-commit): `server/config/server.env`, `server/data/` (DB, log), `server/run/` (PID).
+* `server/` – berjalan di **HP cloud**. **Hanya satu file mandiri: `server/cloudctl`**. Tidak ada file pendamping (konfigurasi bawaan dan skrip auto-start tertanam di dalamnya). `bash cloudctl install` menyiapkan segalanya; file dideploy ke `~/cloud-server`.
+* `admin/` – berjalan di **HP admin**. `admin/cloudctl` (perintah `cloud` setelah `admin/install.sh`) membungkus perintah server lewat SSH, plus file (`ls/mkdir/push/pull/rm`), `doctor`, `info`, `set`, `upgrade`, `monitor`.
 
 ## Konvensi
-* **Pemisahan peran:** kode di `server/` tidak boleh mengasumsikan laptop admin; kode di `admin/` tidak boleh mengasumsikan Termux. Satu-satunya jembatan adalah SSH + `tar`.
-* Setiap perintah baru: implementasi di `server/cloudctl`, lalu (jika perlu remote) tambahkan pembungkus di `admin/cloudctl`, dan perbarui tabel README.
-* `server/`: shebang `#!/data/data/com.termux/files/usr/bin/bash`, `set -eu`, tanpa root, path selalu relatif ke `SERVER_DIR` (via `readlink -f`).
-* `admin/`: shebang `#!/usr/bin/env bash`, `set -euo pipefail`, hanya butuh `ssh`, `scp`, `tar` (tanpa rsync/ssh-copy-id agar jalan di Git Bash).
-* Konfigurasi hanya lewat `*.env` (contoh: `*.env.example`); variabel baru harus punya default di `load_env`/`load_conf`.
-* Skrip idempotent; output untuk mesin (mis. `backup --stdout`) tidak boleh bercampur dengan pesan log.
-* Proses dilacak lewat PID file + verifikasi `/proc/PID/cmdline`, bukan `pkill -f`.
-* Jangan membuka layanan ke internet publik secara default; akses jarak jauh via Tailscale.
-* Bahasa output & dokumen: Indonesia. Wajib lolos `bash -n` (dan `shellcheck` bila tersedia).
+* **Pemisahan peran:** `server/` tidak mengasumsikan HP admin; `admin/` tidak mengasumsikan Termux server. Jembatannya hanya SSH + `tar`/`scp`.
+* Setiap perintah baru: implementasi di `server/cloudctl`; tambahkan pembungkus di `admin/cloudctl` bila perlu remote; perbarui tabel README.
+* `server/`: shebang `#!/data/data/com.termux/files/usr/bin/bash`, `set -eu`, tanpa root, path relatif ke `SERVER_DIR` (via `readlink -f`). **Tetap satu file**: jangan menambah file pendamping; tambahkan teks bawaan sebagai heredoc di dalam `cloudctl`. `install` harus idempotent, tidak boleh membutuhkan input saat `--yes`, dan menyalin dirinya ke `~/cloud-server` bila dijalankan dari luar home Termux.
+* `admin/`: shebang `#!/usr/bin/env bash`, `set -euo pipefail`, hanya butuh `ssh`, `scp`, `tar`.
+* Konfigurasi hanya lewat `*.env`. Server: variabel baru wajib punya default di `load_env` **dan** muncul di heredoc `default_env`. Admin: default di `load_conf` dan contoh di `admin/config/admin.env.example`.
+* Hal yang tidak bisa diotomatiskan (Termux:Boot, pengecualian baterai, Opsi pengembang) dicetak sebagai daftar akhir oleh `install`, bukan diam-diam dilewati.
+* Admin: alamat utama + cadangan (`CLOUD_HOST_ALT`) lewat `reach_host`; semua perintah jarak jauh memanggil `connect` dulu. Perintah destruktif (`rm`, `stop`, `ssh-harden`) wajib minta konfirmasi (kecuali `-y`), dan path dari pengguna wajib lolos `safe_rel`. `ssh-harden` wajib memverifikasi login kunci (BatchMode) lebih dulu.
+* Transfer: pakai `rsync` bila ada di kedua HP, jika tidak `scp`. Kode harus kompatibel bash 3.2 (hindari `"${arr[@]}"` kosong di bawah `set -u`).
+* Skrip idempotent. Proses dilacak lewat PID file + verifikasi `/proc/PID/cmdline`, bukan `pkill -f`. `stop` harus menghentikan watchdog **sebelum** sshd.
+* Uji konektivitas dengan TCP (`/dev/tcp`), bukan `ping`/`curl`/DNS, agar tanpa dependensi.
+* Jangan hardcode asumsi 64-bit; jangan butuh fitur kernel khusus.
+* Repo harus berada di `~` Termux, bukan `/sdcard`.
+* Jangan membuka port ke internet publik; akses jarak jauh via Tailscale.
+* Bahasa output dan dokumen: Indonesia. Wajib lolos `bash -n` (dan `shellcheck` bila tersedia).
 
 ## Ide Lanjutan
-* HTTPS (sertifikat Tailscale / self-signed) untuk Filebrowser.
-* Backup terjadwal otomatis (`crond`) + rotasi backup di `admin/backups/`.
-* Notifikasi baterai/storage lewat `termux-notification`.
-* Wrapper PowerShell native untuk Windows tanpa WSL/Git Bash.
+* Sinkronisasi dua arah otomatis (rsync bila tersedia, atau `scp` bertahap).
+* Backup terjadwal dari HP admin ke penyimpanan lain.
+* Akun SFTP terbatas (satu folder per pengguna) selain akun admin.
+* Antarmuka web (Filebrowser) sebagai lapisan opsional di atas server ini.

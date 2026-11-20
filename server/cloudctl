@@ -1,261 +1,468 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# cloudctl (SERVER) - dijalankan di HP Android (Termux).
-# Satu pintu untuk semua operasi server: setup, start, stop, status, dst.
+# cloudctl (SERVER) - SATU file untuk HP cloud (Termux, Android 9-12, 32/64-bit).
+#
+# Pemasangan awal, cukup satu perintah di HP cloud:
+#     bash cloudctl install
+#
+# Server = sshd (SSH + SFTP) + satu folder penyimpanan + watchdog.
 set -eu
 
-SERVER_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SERVER_DIR="$(dirname "$SELF")"
+INSTALL_DIR="$HOME/cloud-server"
 ENV_FILE="$SERVER_DIR/config/server.env"
 DATA_DIR="$SERVER_DIR/data"
 RUN_DIR="$SERVER_DIR/run"
-PID_FILE="$RUN_DIR/filebrowser.pid"
+WD_PID_FILE="$RUN_DIR/watchdog.pid"
+WD_LOG="$DATA_DIR/watchdog.log"
 SSHD_PID_FILE="${PREFIX:-/data/data/com.termux/files/usr}/var/run/sshd.pid"
 SSHD_CONFIG="${PREFIX:-/data/data/com.termux/files/usr}/etc/ssh/sshd_config"
-PACKAGES="openssh termux-api curl tar gzip procps net-tools nano"
+PACKAGES="openssh termux-api net-tools nano rsync"
 
 log() { printf '%s\n' "$*"; }
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# ---------- konfigurasi (tertanam, dibuat otomatis bila belum ada) ----------
+default_env() {
+  cat <<'ENVEOF'
+# Konfigurasi HP cloud. Ubah lalu jalankan: cloudctl restart
+
+# Folder penyimpanan cloud (di storage bersama Android)
+CLOUD_ROOT="$HOME/storage/shared/CloudStorage"
+
+# Port SSH/SFTP (bawaan Termux: 8022)
+SSH_PORT=8022
+
+# ---- Pengawas (watchdog): menjaga server tetap online ----
+# Seberapa sering (detik) layanan & internet diperiksa
+WD_INTERVAL=60
+# Internet dianggap putus jika uji TCP ini gagal (tanpa DNS, tanpa curl)
+NET_CHECK_HOST=1.1.1.1
+NET_CHECK_PORT=443
+# Berapa kali berturut-turut gagal sebelum pemulihan Wi-Fi dicoba
+WD_NET_FAILS=3
+# 1 = coba matikan-nyalakan Wi-Fi saat internet putus (butuh aplikasi Termux:API;
+#     hanya berhasil di sebagian perangkat)
+WD_WIFI_RECOVER=1
+# Catat peringatan di log jika suhu baterai (derajat C) mencapai angka ini
+WD_TEMP_WARN=42
+# Log dirotasi saat start jika melebihi ukuran ini (KB)
+LOG_MAX_KB=1024
+ENVEOF
+}
+
 load_env() {
   if [ ! -f "$ENV_FILE" ]; then
-    cp "$SERVER_DIR/config/server.env.example" "$ENV_FILE"
-    log "config/server.env dibuat dari contoh."
+    mkdir -p "$(dirname "$ENV_FILE")"
+    default_env > "$ENV_FILE"
+    log "config/server.env dibuat dengan nilai bawaan."
   fi
   set -a
   # shellcheck disable=SC1090
   . "$ENV_FILE"
   set +a
-  FB_PORT="${FB_PORT:-8080}"
-  FB_ADDRESS="${FB_ADDRESS:-0.0.0.0}"
-  FB_ROOT="${FB_ROOT:-$HOME/storage/shared/CloudStorage}"
-  FB_DB="${FB_DB:-$DATA_DIR/filebrowser.db}"
-  FB_LOG="${FB_LOG:-$DATA_DIR/filebrowser.log}"
-  FB_LOG_MAX_KB="${FB_LOG_MAX_KB:-2048}"
+  CLOUD_ROOT="${CLOUD_ROOT:-$HOME/storage/shared/CloudStorage}"
+  SSH_PORT="${SSH_PORT:-8022}"
+  WD_INTERVAL="${WD_INTERVAL:-60}"
+  NET_CHECK_HOST="${NET_CHECK_HOST:-1.1.1.1}"
+  NET_CHECK_PORT="${NET_CHECK_PORT:-443}"
+  WD_NET_FAILS="${WD_NET_FAILS:-3}"
+  WD_WIFI_RECOVER="${WD_WIFI_RECOVER:-1}"
+  WD_TEMP_WARN="${WD_TEMP_WARN:-42}"
+  LOG_MAX_KB="${LOG_MAX_KB:-1024}"
+}
+
+# ---------- info perangkat ----------
+android_ver() { getprop ro.build.version.release 2>/dev/null || echo "?"; }
+android_sdk() { getprop ro.build.version.sdk 2>/dev/null || echo 0; }
+cpu_bits() {  # armv7l/armv8l = userland 32-bit walau CPU-nya 64-bit
+  case "$(uname -m)" in aarch64|arm64|x86_64) echo 64 ;; *) echo 32 ;; esac
+}
+device_line() {
+  log "Perangkat   : Android $(android_ver) (API $(android_sdk)), $(uname -m) $(cpu_bits)-bit, kernel $(uname -r)"
+}
+compat_hint() {
+  local sdk; sdk="$(android_sdk)"
+  if [ "$sdk" -ge 28 ] && [ "$sdk" -le 32 ]; then :; else
+    log "Catatan     : di luar rentang yang diuji (Android 9-12). Mungkin tetap jalan."
+  fi
+  if [ "$sdk" -ge 31 ]; then
+    log "Android 12+ : sistem bisa mematikan proses latar Termux (phantom process killer). Lihat README."
+  fi
 }
 
 # ---------- helper proses & jaringan ----------
-fb_running() {
-  [ -f "$PID_FILE" ] || return 1
-  local pid; pid="$(cat "$PID_FILE")"
-  kill -0 "$pid" 2>/dev/null && grep -q filebrowser "/proc/$pid/cmdline" 2>/dev/null
+pid_is() { # pid_is <pidfile> <kata-di-cmdline>
+  [ -f "$1" ] || return 1
+  local pid; pid="$(cat "$1")"
+  kill -0 "$pid" 2>/dev/null && grep -q "$2" "/proc/$pid/cmdline" 2>/dev/null
 }
+sshd_up() { pid_is "$SSHD_PID_FILE" sshd; }
+wd_up()   { pid_is "$WD_PID_FILE" cloudctl; }
 
-sshd_running() { pgrep -x sshd >/dev/null 2>&1; }
+tcp_ok() { timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
+net_ok() { tcp_ok "$NET_CHECK_HOST" "$NET_CHECK_PORT" || tcp_ok 8.8.8.8 53; }
 
 all_ips() {
-  { ifconfig 2>/dev/null || ip -4 addr 2>/dev/null || true; } | awk '
-    /inet / { ip=$2; sub(/addr:/,"",ip); sub(/\/.*/,"",ip); if (ip !~ /^127\./) print ip }'
+  local out
+  out="$( { ifconfig 2>/dev/null || ip -4 addr 2>/dev/null || true; } | awk '
+    /inet / { ip=$2; sub(/addr:/,"",ip); sub(/\/.*/,"",ip); if (ip !~ /^127\./) print ip }')"
+  if [ -z "$out" ] && have termux-wifi-connectioninfo; then
+    out="$(timeout 8 termux-wifi-connectioninfo 2>/dev/null | sed -n 's/.*"ip": *"\([0-9.]*\)".*/\1/p' | grep -v '^0\.0\.0\.0$' || true)"
+  fi
+  printf '%s\n' "$out"
+}
+
+is_tailscale_ip() {
+  case "$1" in 100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 0 ;; *) return 1 ;; esac
 }
 
 print_access() {
-  local ip label
+  local ip label found=0
   for ip in $(all_ips); do
-    case "$ip" in
-      100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) label="Tailscale" ;;
-      *) label="LAN" ;;
-    esac
-    log "Akses $label : http://$ip:$FB_PORT   |   ssh -p 8022 $(whoami)@$ip"
+    if is_tailscale_ip "$ip"; then label="Tailscale"; else label="Wi-Fi"; fi
+    log "Alamat $label : ssh -p $SSH_PORT $(whoami)@$ip"
+    found=1
   done
+  [ "$found" = 1 ] || log "Alamat      : (IP tidak terdeteksi, cek koneksi Wi-Fi)"
 }
 
-rotate_log() {
-  [ -f "$FB_LOG" ] || return 0
-  if [ "$(( $(wc -c < "$FB_LOG") / 1024 ))" -gt "$FB_LOG_MAX_KB" ]; then
-    mv -f "$FB_LOG" "$FB_LOG.old"
-    log "Log dirotasi."
+rotate_log() { # rotate_log <file>
+  [ -f "$1" ] || return 0
+  if [ "$(( $(wc -c < "$1") / 1024 ))" -gt "$LOG_MAX_KB" ]; then
+    mv -f "$1" "$1.old"
   fi
 }
 
-# ---------- perintah ----------
-cmd_setup() {
-  [ "$(uname -m)" = "aarch64" ] || die "Hanya mendukung 64-bit (aarch64), terdeteksi: $(uname -m)"
-  load_env
+# =====================================================================
+#  INSTALL: satu perintah untuk menyiapkan segalanya
+# =====================================================================
+STEP=0; TOTAL=7
+step() { STEP=$((STEP + 1)); log ""; log "[$STEP/$TOTAL] $*"; }
 
-  if [ ! -d "$HOME/storage/shared" ]; then
-    have termux-setup-storage && termux-setup-storage || true
-    sleep 2
-    [ -d "$HOME/storage/shared" ] || die "Akses storage belum diberikan. Jalankan 'termux-setup-storage' langsung di HP (tidak bisa lewat SSH), izinkan, lalu ulangi."
+ensure_storage() {
+  if [ -d "$HOME/storage/shared" ]; then
+    log "Izin storage sudah ada."
+    return 0
   fi
+  have termux-setup-storage || die "termux-setup-storage tidak ditemukan. Perbarui Termux dari F-Droid/GitHub."
+  log "Sebentar lagi muncul permintaan izin di layar HP ini. Ketuk IZINKAN."
+  termux-setup-storage || true
+  local i
+  for i in $(seq 1 "${CLOUD_STORAGE_WAIT:-45}"); do
+    [ -d "$HOME/storage/shared" ] && { log "Izin storage diberikan."; return 0; }
+    sleep 1
+  done
+  die "Izin storage belum diberikan. Jalankan 'termux-setup-storage' langsung di HP ini, izinkan, lalu ulangi: bash cloudctl install"
+}
 
-  log "Memasang paket: $PACKAGES"
-  pkg update -y >/dev/null
+cmd_install() {
+  local yes=0 nopass=0 a interactive=0 ip user wifi_ip="" ts_ip=""
+  for a in "$@"; do
+    case "$a" in
+      --yes|-y)    yes=1 ;;
+      --no-passwd) nopass=1 ;;
+      *) die "Opsi tidak dikenal: $a (opsi: --yes, --no-passwd)" ;;
+    esac
+  done
+
+  # Pindah ke lokasi tetap bila dijalankan dari luar home Termux (mis. /sdcard/Download)
+  case "$SERVER_DIR" in
+    "$HOME"/*) ;;
+    *)
+      mkdir -p "$INSTALL_DIR"
+      cp -f "$SELF" "$INSTALL_DIR/cloudctl"
+      chmod +x "$INSTALL_DIR/cloudctl"
+      log "Skrip disalin ke $INSTALL_DIR/cloudctl"
+      exec bash "$INSTALL_DIR/cloudctl" install "$@"
+      ;;
+  esac
+  [ -t 0 ] && [ "$yes" = 0 ] && interactive=1
+
+  log "=== Pemasangan HP cloud ==="
+
+  step "Memeriksa lingkungan"
+  have pkg || die "Skrip ini hanya untuk Termux di Android."
+  device_line; compat_hint
+  case "${TERMUX_APK_RELEASE:-}" in
+    GOOGLE_PLAY) log "PERINGATAN: Termux dari Play Store sudah usang dan sering bermasalah. Pasang dari F-Droid atau GitHub." ;;
+  esac
+
+  step "Izin akses penyimpanan"
+  ensure_storage
+
+  step "Memasang paket ($PACKAGES)"
+  if ! pkg update -y >/dev/null 2>&1; then
+    have sshd || die "Gagal memperbarui daftar paket. Cek internet, atau ganti mirror: termux-change-repo"
+    log "Peringatan: pkg update gagal, memakai paket yang sudah ada."
+  fi
   # shellcheck disable=SC2086
   pkg install -y $PACKAGES
 
-  if have filebrowser; then
-    log "Filebrowser sudah terpasang: $(filebrowser version | head -n1)"
-  else
-    install_filebrowser
-  fi
-  mkdir -p "$FB_ROOT" "$DATA_DIR"
-  log "Setup selesai. Atur password SSH bila belum: passwd"
-}
-
-install_filebrowser() {
-  local tmp url tag
-  tmp="$(mktemp -d "${TMPDIR:-$PREFIX/tmp}/fb.XXXXXX")"
-  trap 'rm -rf "$tmp"' RETURN
-  log "Mencari rilis Filebrowser terbaru (linux-arm64)..."
-  curl -fsS --retry 3 https://api.github.com/repos/filebrowser/filebrowser/releases/latest > "$tmp/release.json" \
-    || die "Gagal menghubungi GitHub API (cek internet / rate limit)."
-  url="$(grep 'browser_download_url.*linux-arm64.*tar.gz' "$tmp/release.json" | head -n1 | cut -d '"' -f 4)"
-  tag="$(grep '"tag_name"' "$tmp/release.json" | head -n1 | cut -d '"' -f 4)"
-  [ -n "$url" ] || die "URL rilis linux-arm64 tidak ditemukan."
-
-  if [ "${1:-}" = "--if-newer" ] && have filebrowser && filebrowser version 2>/dev/null | grep -q "${tag#v}"; then
-    log "Filebrowser sudah versi terbaru ($tag)."
-    return 0
-  fi
-
-  log "Mengunduh $tag ..."
-  curl -fsSL --retry 3 "$url" -o "$tmp/fb.tar.gz"
-  tar -xzf "$tmp/fb.tar.gz" -C "$tmp" filebrowser
-  chmod +x "$tmp/filebrowser"
-  mv -f "$tmp/filebrowser" "$PREFIX/bin/filebrowser"
-  log "Terpasang: $(filebrowser version | head -n1)"
-}
-
-cmd_update() {
-  local was_running=0
+  step "Menyiapkan folder dan konfigurasi"
   load_env
-  fb_running && was_running=1 && cmd_stop
-  install_filebrowser --if-newer
-  [ "$was_running" = 1 ] && cmd_start
-  return 0
+  mkdir -p "$CLOUD_ROOT" "$DATA_DIR" "$RUN_DIR"
+  ssh-keygen -A >/dev/null 2>&1 || true   # kunci host sshd (idempotent)
+  log "Folder cloud : $CLOUD_ROOT"
+  log "Konfigurasi  : $ENV_FILE"
+
+  step "Akses SSH"
+  if [ -s "$HOME/.termux_authinfo" ] || [ -s "$HOME/.ssh/authorized_keys" ]; then
+    log "Password atau kunci SSH sudah ada."
+  elif [ "$nopass" = 1 ] || [ "$interactive" = 0 ]; then
+    log "PERINGATAN: belum ada password SSH. Jalankan 'passwd' sebelum HP admin terhubung."
+  else
+    log "Atur password SSH (dipakai HP admin satu kali saat 'cloud init'):"
+    passwd || log "Dilewati. Jalankan 'passwd' nanti sebelum HP admin terhubung."
+  fi
+
+  step "Menjalankan server"
+  cmd_start
+
+  step "Auto-start saat HP restart"
+  cmd_boot_install
+
+  # ---- ringkasan ----
+  user="$(whoami)"
+  for ip in $(all_ips); do
+    if is_tailscale_ip "$ip"; then [ -n "$ts_ip" ] || ts_ip="$ip"
+    else [ -n "$wifi_ip" ] || wifi_ip="$ip"; fi
+  done
+  log ""
+  log "=== SELESAI ==="
+  log "HP cloud siap. Sekarang di HP admin jalankan:"
+  log ""
+  log "    cloud init ${wifi_ip:-<IP-HP-INI>} $user"
+  [ -n "$ts_ip" ] && log "    cloud set CLOUD_HOST_ALT $ts_ip     # alamat Tailscale (opsional)"
+  log ""
+  log "Yang tidak bisa diotomatiskan dan perlu Anda setel sekali di HP ini:"
+  log "  1. Buka aplikasi Termux:Boot satu kali (agar auto-start aktif)."
+  log "  2. Pengaturan > Baterai: Termux, Termux:Boot, Termux:API = Tanpa pembatasan."
+  log "  3. Opsi pengembang: aktifkan 'Tetap aktif' saat mengisi daya."
+  log "  4. Colok charger terus dan taruh di tempat berventilasi."
+  if [ "$(android_sdk)" -ge 31 ]; then
+    log "  5. Android 12: lihat README soal phantom process killer."
+  fi
+  if [ "$interactive" = 1 ] && have am; then
+    local ans=""
+    read -r -p "Buka pengaturan pengecualian baterai sekarang? [y/N] " ans || true
+    if [ "$ans" = y ] || [ "$ans" = Y ]; then
+      am start -a android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS >/dev/null 2>&1 \
+        || log "Tidak bisa membuka pengaturan otomatis. Buka manual lewat Pengaturan > Baterai."
+    fi
+  fi
+}
+
+# =====================================================================
+#  Perintah harian
+# =====================================================================
+start_watchdog() {
+  if wd_up; then
+    log "Watchdog sudah berjalan (PID $(cat "$WD_PID_FILE"))."
+  else
+    nohup bash "$SELF" _watchdog >> "$WD_LOG" 2>&1 < /dev/null &
+    echo $! > "$WD_PID_FILE"
+    log "Watchdog dijalankan (cek tiap ${WD_INTERVAL} dtk)."
+  fi
+}
+
+stop_watchdog() {
+  wd_up && kill "$(cat "$WD_PID_FILE")" 2>/dev/null || true
+  rm -f "$WD_PID_FILE"
+}
+
+start_sshd() {
+  sshd -p "$SSH_PORT" && sleep 1 && sshd_up
 }
 
 cmd_start() {
   load_env
-  have filebrowser || die "Filebrowser belum terpasang. Jalankan: cloudctl setup"
-  mkdir -p "$FB_ROOT" "$DATA_DIR" "$RUN_DIR" "$(dirname "$FB_DB")" "$(dirname "$FB_LOG")"
-  rotate_log
+  have sshd || die "openssh belum terpasang. Jalankan: bash cloudctl install"
+  mkdir -p "$CLOUD_ROOT" "$DATA_DIR" "$RUN_DIR"
+  rotate_log "$WD_LOG"
   have termux-wake-lock && termux-wake-lock || true
 
-  if sshd_running; then
-    log "sshd sudah berjalan."
-  elif have sshd; then
-    sshd && log "sshd dijalankan (port 8022)."
+  if sshd_up; then
+    log "sshd sudah berjalan (port $SSH_PORT)."
   else
-    log "Peringatan: openssh belum terpasang (jalankan 'cloudctl setup')."
+    start_sshd || die "sshd gagal start. Cek: sshd -p $SSH_PORT -d (port terpakai? password belum diatur?)"
+    log "sshd dijalankan (port $SSH_PORT)."
   fi
-
-  if fb_running; then
-    log "Filebrowser sudah berjalan (PID $(cat "$PID_FILE"))."
-  else
-    nohup filebrowser -a "$FB_ADDRESS" -p "$FB_PORT" -r "$FB_ROOT" -d "$FB_DB" >> "$FB_LOG" 2>&1 &
-    echo $! > "$PID_FILE"
-    sleep 2
-    fb_running || { rm -f "$PID_FILE"; die "Filebrowser gagal start. Cek: cloudctl logs"; }
-    log "Filebrowser dijalankan (PID $(cat "$PID_FILE"))."
-  fi
-  log "Folder root : $FB_ROOT"
+  start_watchdog
+  log "Folder cloud: $CLOUD_ROOT"
   print_access
 }
 
 cmd_stop() {
-  local i
-  if fb_running; then
-    kill "$(cat "$PID_FILE")"
-    for i in 1 2 3 4 5; do fb_running || break; sleep 1; done
-    fb_running && kill -9 "$(cat "$PID_FILE")" 2>/dev/null || true
-    log "Filebrowser dihentikan."
+  load_env
+  stop_watchdog   # harus duluan, kalau tidak sshd dihidupkan lagi
+  if sshd_up; then
+    # Hanya listener yang dimatikan; sesi SSH yang sedang aktif tidak terputus.
+    kill "$(cat "$SSHD_PID_FILE")" 2>/dev/null && log "sshd dihentikan."
   else
-    log "Filebrowser tidak berjalan."
+    log "sshd tidak berjalan."
   fi
-  rm -f "$PID_FILE"
-  if [ "${1:-}" = "--all" ]; then
-    # Hanya listener sshd yang dimatikan; sesi SSH aktif tidak terputus.
-    if [ -f "$SSHD_PID_FILE" ]; then kill "$(cat "$SSHD_PID_FILE")" 2>/dev/null && log "sshd dihentikan."; fi
-    have termux-wake-unlock && termux-wake-unlock && log "Wake-lock dilepas."
-  fi
+  have termux-wake-unlock && termux-wake-unlock && log "Wake-lock dilepas." || true
 }
 
 cmd_restart() { cmd_stop; cmd_start; }
 
+# Dipanggil Termux:Boot: tunggu jaringan siap (maks ~60 dtk), lalu start.
+cmd_boot() {
+  load_env
+  mkdir -p "$DATA_DIR"
+  have termux-wake-lock && termux-wake-lock || true
+  local i
+  for i in $(seq 1 30); do
+    [ -n "$(all_ips)" ] && break
+    sleep 2
+  done
+  cmd_start
+}
+
+# ---------- watchdog: menjaga sshd & koneksi tetap hidup ----------
+wd_log() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
+
+recover_wifi() {
+  if ! have termux-wifi-enable; then
+    wd_log "termux-api tidak terpasang, pemulihan Wi-Fi dilewati"
+    return 0
+  fi
+  wd_log "Mencoba mematikan lalu menyalakan Wi-Fi"
+  timeout 10 termux-wifi-enable false || true
+  sleep 4
+  timeout 10 termux-wifi-enable true || true
+}
+
+cmd_watchdog() { # proses latar belakang internal, jangan dipanggil manual
+  set +e
+  load_env
+  local fails=0 hot=0 unplug=0 bat temp plugged
+  wd_log "watchdog mulai (interval ${WD_INTERVAL}s, PID $$)"
+  while true; do
+    sleep "$WD_INTERVAL"
+
+    if ! sshd_up; then
+      wd_log "sshd mati, menyalakan ulang"
+      if start_sshd; then wd_log "sshd hidup lagi"; else wd_log "sshd gagal dinyalakan"; fi
+    fi
+
+    if net_ok; then
+      [ "$fails" -ge "$WD_NET_FAILS" ] && wd_log "Internet kembali setelah $fails kali gagal"
+      fails=0
+    else
+      fails=$((fails + 1))
+      wd_log "Internet tidak terjangkau ($fails)"
+      if [ "$WD_WIFI_RECOVER" = 1 ] && [ "$fails" -ge "$WD_NET_FAILS" ] \
+         && [ $((fails % (WD_NET_FAILS * 5))) -eq "$WD_NET_FAILS" ]; then
+        recover_wifi
+      fi
+    fi
+
+    if have termux-battery-status; then
+      bat="$(timeout 8 termux-battery-status 2>/dev/null)"
+      if [ -n "$bat" ]; then
+        temp="$(printf '%s\n' "$bat" | sed -n 's/.*"temperature": *\([0-9]*\).*/\1/p' | head -n1)"
+        plugged="$(printf '%s\n' "$bat" | sed -n 's/.*"plugged": *"\([A-Z_]*\)".*/\1/p' | head -n1)"
+        if [ -n "$temp" ] && [ "$temp" -ge "$WD_TEMP_WARN" ]; then
+          [ "$hot" = 0 ] && wd_log "PERINGATAN: suhu baterai ${temp} C (batas $WD_TEMP_WARN)"
+          hot=1
+        else hot=0; fi
+        if [ "$plugged" = "UNPLUGGED" ]; then
+          [ "$unplug" = 0 ] && wd_log "PERINGATAN: charger tidak terhubung"
+          unplug=1
+        else unplug=0; fi
+      fi
+    fi
+  done
+}
+
 cmd_status() {
   load_env
-  sshd_running && log "sshd        : BERJALAN (8022)" || log "sshd        : mati"
-  fb_running   && log "filebrowser : BERJALAN (port $FB_PORT, PID $(cat "$PID_FILE"))" || log "filebrowser : mati"
+  device_line
+  sshd_up && log "sshd        : BERJALAN (port $SSH_PORT)" || log "sshd        : mati"
+  wd_up   && log "watchdog    : BERJALAN (tiap ${WD_INTERVAL} dtk)" || log "watchdog    : mati"
+  net_ok  && log "Internet    : OK" || log "Internet    : TIDAK TERJANGKAU"
   print_access
-  log "Storage     : $(df -h "$( [ -d "$FB_ROOT" ] && echo "$FB_ROOT" || echo "$HOME" )" 2>/dev/null | awk 'NR==2 {print $3" terpakai / "$2" ("$5")"}')"
+  if [ -d "$CLOUD_ROOT" ]; then
+    log "Folder cloud: $CLOUD_ROOT ($(du -sh "$CLOUD_ROOT" 2>/dev/null | cut -f1) terpakai)"
+    log "Storage     : $(df -h "$CLOUD_ROOT" 2>/dev/null | awk 'NR==2 {print $4" tersisa dari "$2" ("$5" terpakai)"}')"
+  else
+    log "Folder cloud: $CLOUD_ROOT (belum ada, jalankan: bash cloudctl install)"
+  fi
   if have termux-battery-status; then
     log "Baterai     : $(timeout 5 termux-battery-status 2>/dev/null | tr -d ' \n' | sed 's/[{}"]//g')"
   fi
   log "Uptime      : $(uptime -p 2>/dev/null || uptime)"
+  compat_hint
 }
 
-cmd_logs() {
-  load_env
-  [ -f "$FB_LOG" ] || die "Belum ada log di $FB_LOG"
-  if [ "${1:-}" = "-f" ]; then tail -n 50 -f "$FB_LOG"; else tail -n "${1:-50}" "$FB_LOG"; fi
-}
-
-# backup [folder]   -> simpan file tar.gz di HP
-# backup --stdout   -> tulis tar.gz ke stdout (dipakai admin untuk menarik backup)
-cmd_backup() {
-  load_env
-  local files=()
-  [ -f "$FB_DB" ] && files+=("$FB_DB")
-  [ -f "$ENV_FILE" ] && files+=("$ENV_FILE")
-  [ ${#files[@]} -gt 0 ] || die "Tidak ada yang dibackup."
-  if [ "${1:-}" = "--stdout" ]; then
-    tar -czf - "${files[@]}" 2>/dev/null
-    return 0
-  fi
-  local dest="${1:-$HOME/storage/shared/CloudBackup}" out
-  mkdir -p "$dest"
-  out="$dest/cloud-config-$(date +%Y%m%d-%H%M%S).tar.gz"
-  tar -czf "$out" "${files[@]}" 2>/dev/null
-  log "Backup tersimpan: $out"
+cmd_logs() { # logs [N | -f]
+  local follow=0 n=50 a
+  for a in "$@"; do
+    case "$a" in -f) follow=1 ;; [0-9]*) n="$a" ;; esac
+  done
+  [ -f "$WD_LOG" ] || die "Belum ada log di $WD_LOG"
+  if [ "$follow" = 1 ]; then tail -n "$n" -f "$WD_LOG"; else tail -n "$n" "$WD_LOG"; fi
 }
 
 cmd_boot_install() {
   local dir="$HOME/.termux/boot"
-  mkdir -p "$dir"
-  printf '#!/data/data/com.termux/files/usr/bin/bash\nexec bash "%s/boot/start-cloud.sh"\n' "$SERVER_DIR" > "$dir/start-cloud.sh"
-  chmod +x "$dir/start-cloud.sh" "$SERVER_DIR/boot/start-cloud.sh"
+  mkdir -p "$dir" "$DATA_DIR"
+  printf '#!/data/data/com.termux/files/usr/bin/bash\nexec bash "%s" boot >> "%s/boot.log" 2>&1\n' \
+    "$SERVER_DIR/cloudctl" "$DATA_DIR" > "$dir/start-cloud.sh"
+  chmod +x "$dir/start-cloud.sh" "$SERVER_DIR/cloudctl"
   log "Auto-start terpasang: $dir/start-cloud.sh"
-  log "Buka aplikasi Termux:Boot sekali & matikan optimasi baterai untuk Termux/Termux:Boot."
+  log "Agar aktif: buka aplikasi Termux:Boot satu kali."
 }
 
 # Matikan login password SSH (hanya kunci publik). Pastikan kunci sudah terpasang!
 cmd_ssh_harden() {
-  [ -s "$HOME/.ssh/authorized_keys" ] || die "~/.ssh/authorized_keys kosong. Jalankan 'cloudctl init' dari admin dulu."
+  load_env
+  [ -s "$HOME/.ssh/authorized_keys" ] || die "~/.ssh/authorized_keys kosong. Jalankan 'cloud init' dari HP admin dulu."
   if grep -q '^PasswordAuthentication' "$SSHD_CONFIG" 2>/dev/null; then
     sed -i 's/^PasswordAuthentication.*/PasswordAuthentication no/' "$SSHD_CONFIG"
   else
     echo 'PasswordAuthentication no' >> "$SSHD_CONFIG"
   fi
   [ -f "$SSHD_PID_FILE" ] && kill "$(cat "$SSHD_PID_FILE")" 2>/dev/null || true
-  sleep 1; sshd
+  sleep 1
+  start_sshd || die "sshd gagal start ulang. Periksa $SSHD_CONFIG"
   log "Login password SSH dinonaktifkan; hanya kunci publik yang diterima."
 }
 
 cmd_help() {
   cat <<'H'
-cloudctl (server) - perintah:
-  setup            instal paket + Filebrowser (idempotent)
-  start | stop [--all] | restart
-  status           status layanan, alamat akses, storage, baterai
-  logs [-f|N]      lihat log Filebrowser
-  update           perbarui Filebrowser ke rilis terbaru
-  backup [dir|--stdout]
-  boot-install     pasang auto-start Termux:Boot
+cloudctl (server) - satu file untuk HP cloud
+
+Pertama kali (satu perintah, mengerjakan semuanya):
+  install [--yes] [--no-passwd]
+                   izin storage, paket, folder, password, jalankan server, auto-start
+                   (setup = nama lain untuk install)
+
+Harian:
+  start            jalankan sshd + watchdog (menjaga server tetap online)
+  stop             hentikan sshd + watchdog, lepas wake-lock
+  restart
+  status           perangkat, layanan, internet, alamat, storage, baterai
+  logs [-f|N]      log watchdog
+  boot-install     pasang ulang auto-start Termux:Boot
   ssh-harden       nonaktifkan login password SSH
 H
 }
 
 case "${1:-help}" in
-  setup)        cmd_setup ;;
+  install|setup) shift; cmd_install "$@" ;;
   start)        cmd_start ;;
-  stop)         shift; cmd_stop "${1:-}" ;;
+  stop)         cmd_stop ;;
   restart)      cmd_restart ;;
   status)       cmd_status ;;
-  logs)         shift; cmd_logs "${1:-}" ;;
-  update)       cmd_update ;;
-  backup)       shift; cmd_backup "${1:-}" ;;
+  logs)         shift; cmd_logs "$@" ;;
   boot-install) cmd_boot_install ;;
+  boot)         cmd_boot ;;
   ssh-harden)   cmd_ssh_harden ;;
+  _watchdog)    cmd_watchdog ;;
   help|-h|--help) cmd_help ;;
   *) cmd_help; exit 1 ;;
 esac
